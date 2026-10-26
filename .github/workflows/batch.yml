@@ -1,0 +1,65 @@
+# Runs an encrypted batch job pushed as a branch named J<id> (holding payload.bin and shards.txt).
+# The job's key is a one-off repository secret K_<id>; logs show nothing but step names.
+name: batch
+run-name: ${{ github.ref_name }}
+
+on:
+  push:
+    branches: ["J*"]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.n.outputs.shards }}
+      count: ${{ steps.n.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: shards.txt
+          sparse-checkout-cone-mode: false
+      - id: n
+        name: count
+        run: |
+          n=$(tr -dc 0-9 < shards.txt)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "shards=$(python3 -c "print(list(range($n)))")" >> "$GITHUB_OUTPUT"
+
+  work:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      BOX_KEY: ${{ secrets[format('K_{0}', github.ref_name)] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: open
+        run: |
+          python -m pip install -q cryptography > /dev/null 2>&1
+          python .github/box.py open payload.bin job "${{ github.ref_name }}"
+          rm payload.bin
+      - name: work
+        run: python job/main.py ${{ matrix.shard }} ${{ needs.plan.outputs.count }} out > /dev/null 2>&1 || true
+      - name: seal
+        if: always()
+        run: |
+          mkdir -p out
+          python .github/box.py seal out result.bin "${{ github.ref_name }}/${{ matrix.shard }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r${{ matrix.shard }}
+          path: result.bin
+          retention-days: 2
+          compression-level: 0
